@@ -5,15 +5,6 @@ paper-first with **honest fee and slippage accounting**. Live websocket market
 data from Kraken and Coinbase (Binance auto-disables on US geo-block), a risk
 gate in front of every trade, and a dark dashboard made for an iPad on your desk.
 
-> **Reality check, up front.** The viral "$68 → $750K" posts are engagement
-> bait — their own screenshots say *SIMULATED*. Real cross-venue arb edges are
-> 0.05–0.3% and get eaten by taker fees (Kraken 0.40% + Coinbase 0.60% at
-> starter tiers = 1.0% round trip). This engine will show you **zero fills** on
-> those venues at starter fee tiers, because that is the truth. The path to
-> real fills is: volume-tier fee discounts, maker (post-only) execution, or a
-> venue pair with tighter fees. The engine exists so you can *measure* the edge
-> instead of believing a tweet.
-
 ## Run it (no API keys needed)
 
 ```bash
