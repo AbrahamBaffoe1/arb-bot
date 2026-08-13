@@ -1,0 +1,16 @@
+[project]
+name = "arb-bot"
+version = "0.1.0"
+description = "Multi-venue crypto arbitrage engine: cross-exchange + triangular, paper-first, honest fee/slippage accounting"
+requires-python = ">=3.12"
+dependencies = [
+    "ccxt>=4.4.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+]
+
+[tool.uv]
+package = false

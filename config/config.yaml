@@ -1,0 +1,65 @@
+# ============================================================
+# arb-bot configuration
+# Paper mode needs NO API keys — public websocket data only.
+# ============================================================
+
+mode: paper            # paper | live   (live requires keys in .env + explicit confirmation)
+
+venues:
+  binance:
+    enabled: false     # geo-blocked from this IP (HTTP 451) — re-enable if running from a non-US VPS
+    taker_fee: 0.0010  # 0.10%
+    maker_fee: 0.0010
+  kraken:
+    enabled: true
+    taker_fee: 0.0040  # 0.40% (starter tier — drops with volume)
+    maker_fee: 0.0025
+  coinbase:            # Coinbase Advanced Trade
+    enabled: true
+    taker_fee: 0.0060  # 0.60% (starter tier)
+    maker_fee: 0.0040
+
+# Arb groups: the same asset quoted in USDT on every venue so prices
+# are directly comparable (no USD/USDT basis contamination).
+# Symbol syntax is ccxt-unified; each venue maps it internally.
+arb_groups:
+  BTC:  { binance: "BTC/USDT",  kraken: "BTC/USDT",  coinbase: "BTC/USDT" }
+  ETH:  { binance: "ETH/USDT",  kraken: "ETH/USDT",  coinbase: "ETH/USDT" }
+  SOL:  { binance: "SOL/USDT",  kraken: "SOL/USDT",  coinbase: "SOL/USDT" }
+  XRP:  { binance: "XRP/USDT",  kraken: "XRP/USDT",  coinbase: "XRP/USDT" }
+  DOGE: { binance: "DOGE/USDT", kraken: "DOGE/USDT", coinbase: "DOGE/USDT" }
+  ADA:  { binance: "ADA/USDT",  kraken: "ADA/USDT",  coinbase: "ADA/USDT" }
+  LTC:  { binance: "LTC/USDT",  kraken: "LTC/USDT" }   # coinbase has no LTC/USDT market
+  LINK: { binance: "LINK/USDT", kraken: "LINK/USDT", coinbase: "LINK/USDT" }
+
+# Triangular loops evaluated on a single venue (no transfer risk).
+triangles:
+  binance:
+    - ["BTC/USDT", "ETH/BTC", "ETH/USDT"]   # USDT -> BTC -> ETH -> USDT
+    - ["BTC/USDT", "SOL/BTC", "SOL/USDT"]
+    - ["BTC/USDT", "XRP/BTC", "XRP/USDT"]
+    - ["BTC/USDT", "LTC/BTC", "LTC/USDT"]
+  kraken:
+    - ["BTC/USDT", "ETH/BTC", "ETH/USDT"]
+
+scanner:
+  interval_ms: 200          # scan cadence over cached books
+  min_net_edge: 0.0005      # 0.05% AFTER all fees+slippage or we don't fire
+  slippage_buffer: 0.0002   # extra 0.02% safety haircut on every leg
+  book_depth: 10            # order-book levels kept per side
+  stale_book_ms: 3000       # ignore books older than this
+
+risk:
+  trade_notional_usdt: 200      # size per arb attempt
+  max_daily_loss_usdt: 50       # paper too — builds the discipline
+  max_open_skew_usdt: 1000      # inventory drift limit per venue
+  cooldown_s: 2                 # per arb-group cooldown after a fill
+  kill_switch_file: "data/KILL" # touch this file -> engine halts instantly
+
+paper:
+  starting_balance_usdt: 5000   # per venue
+  starting_balance_base: 0.0    # auto-seeded per group at first price
+
+dashboard:
+  host: "0.0.0.0"               # 0.0.0.0 so the iPad can reach it on LAN
+  port: 8421
