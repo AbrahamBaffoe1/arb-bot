@@ -113,6 +113,18 @@
 </header>
 
 <div class="grid">
+  <div class="card" style="grid-column:1/-1">
+    <h2>Funding review</h2>
+    <p id="funding-message">Collecting live market evidence. No funding request yet.</p>
+    <p id="funding-progress" class="ts"></p>
+    <ul id="funding-blockers" style="padding-left:20px;margin-top:10px"></ul>
+    <pre id="funding-plan" style="white-space:pre-wrap;margin-top:10px"></pre>
+    <p class="ts">Funds remain in your exchange accounts. Paper fills are simulated; partial fills and inventory losses remain possible.</p>
+  </div>
+  <div class="card" style="grid-column:1/-1">
+    <h2>Best routes after all modeled costs</h2>
+    <div id="routes">Waiting for fresh books on both exchanges…</div>
+  </div>
   <div class="tiles">
     <div class="card tile">
       <div class="label">Total equity</div>
@@ -120,7 +132,7 @@
       <div class="delta" id="equity-delta"></div>
     </div>
     <div class="card tile">
-      <div class="label">Realized P&amp;L</div>
+      <div class="label">Strategy P&amp;L after modeled costs</div>
       <div class="value" id="pnl">—</div>
     </div>
     <div class="card tile">
@@ -139,7 +151,7 @@
   </div>
 
   <div class="card" id="chart-card">
-    <h2>Equity — paper account, all venues (USDT)</h2>
+    <h2 id="equity-title">Equity — paper account, all venues (USDT)</h2>
     <div id="chart-wrap">
       <canvas id="chart"></canvas>
       <div id="tip"></div>
@@ -157,12 +169,12 @@
   </div>
 
   <div class="card half">
-    <h2>Executed fills</h2>
+    <h2 id="fills-title">Simulated fills</h2>
     <div class="feed" id="fills"><div class="empty">no fills yet</div></div>
   </div>
 
   <div class="card half">
-    <h2>Paper balances</h2>
+    <h2 id="balances-title">Paper balances</h2>
     <div id="balances"><div class="empty">—</div></div>
   </div>
 </div>
@@ -174,10 +186,23 @@ const money = n => (n < 0 ? "−$" : "$") + fmt(Math.abs(n));
 const pct = n => (n*100).toFixed(3) + "%";
 const hhmm = ts => new Date(ts*1000).toLocaleTimeString([], {hour12:false});
 const signCls = n => n > 0 ? "up" : n < 0 ? "down" : "";
+const escapeHTML = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 let startEquity = null, curve = [];
 
 function render(s) {
+  const funding = s.funding;
+  $("funding-message").textContent = funding.message;
+  $("funding-progress").textContent = `${fmt(funding.observation_hours)} healthy hours · ${funding.independent_paper_fills} independent paper fills · ${fmt(funding.net_paper_pnl_usdt,4)} USDT net simulated P&L`;
+  $("funding-blockers").replaceChildren(...funding.blockers.map(text => {
+    const item = document.createElement("li"); item.textContent = text; return item;
+  }));
+  $("funding-plan").textContent = funding.proposal ? "Indicative pilot balances (historical quote):\n" + JSON.stringify(funding.proposal, null, 2) : "";
+  $("routes").innerHTML = s.route_estimates.length ? "<table><tr><th>Asset / route</th><th>Size (USDT)</th><th>Net edge</th><th>Estimated profit (USDT)</th></tr>" + s.route_estimates.map(r =>
+    `<tr><td>${escapeHTML(r.group)} · ${escapeHTML(r.buy_venue)} → ${escapeHTML(r.sell_venue)}</td><td>${fmt(r.notional)}</td><td class="${signCls(r.net_edge)}">${pct(r.net_edge)}</td><td class="${signCls(r.net_profit)}">${fmt(r.net_profit,4)}</td></tr>`).join("") + "</table>" : "No routes with fresh books and sufficient depth on both exchanges.";
+  $("fills-title").textContent = s.mode === "live" ? "Confirmed live fills" : "Simulated fills";
+  $("balances-title").textContent = s.mode === "live" ? "Exchange balances" : "Paper balances";
+  $("equity-title").textContent = `Equity — ${s.mode} account, all venues (USDT; last available marks)`;
   // header
   $("mode").textContent = s.mode.toUpperCase();
   $("venues").innerHTML = Object.entries(s.venue_status).map(([v, st]) =>
@@ -218,11 +243,13 @@ function render(s) {
       }).join("") + "</table>";
   }
 
+  if (!venues.length) $("spreads").textContent = "Waiting for fresh books…";
+
   // opportunity feed
   if (s.opportunities.length) {
     $("opps").innerHTML = "<table>" + s.opportunities.map(o =>
       `<tr><td class="ts">${hhmm(o.ts)}</td><td class="sym">${o.kind}·${o.group}</td>
-       <td style="text-align:left">${o.detail}</td>
+       <td style="text-align:left">${escapeHTML(o.detail)}<br><span class="ts">${escapeHTML(o.status)} ${escapeHTML(o.reason || "")}</span></td>
        <td class="up">+${pct(o.net_edge)}</td><td class="up">${money(o.net_profit)}</td></tr>`
     ).join("") + "</table>";
   }
@@ -336,7 +363,7 @@ new ResizeObserver(drawChart).observe(wrap);
 function connect() {
   const ws = new WebSocket((location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws");
   ws.onmessage = e => render(JSON.parse(e.data));
-  ws.onclose = () => setTimeout(connect, 2000);
+  ws.onclose = () => { $("scanrate").textContent = "Disconnected — data may be stale"; $("funding-message").textContent = "Disconnected. Reconnect to check funding readiness."; setTimeout(connect, 2000); };
 }
 connect();
 </script>

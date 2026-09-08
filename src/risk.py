@@ -18,20 +18,24 @@ class RiskManager:
         self.halted_reason: str | None = None
 
     def allow(self, opp: Opportunity, pnl_today: float, skew_usdt: float) -> bool:
-        if self.kill_file.exists():
-            self._halt("kill switch file present")
+        if self.check_halt(pnl_today):
             return False
-        if pnl_today <= -abs(self.cfg["max_daily_loss_usdt"]):
-            self._halt(f"daily loss cap hit ({pnl_today:.2f} USDT)")
-            return False
-        if skew_usdt > self.cfg["max_open_skew_usdt"] * 1.5:
-            log.warning("skip %s: inventory skew %.0f USDT over limit", opp.group, skew_usdt)
+        if skew_usdt > self.cfg["max_open_skew_usdt"]:
             return False
         last = self.last_fill.get(opp.group, 0.0)
         if time.time() - last < self.cfg["cooldown_s"]:
             return False
-        self.halted_reason = None
         return True
+
+    def check_halt(self, pnl_today: float) -> bool:
+        if self.kill_file.exists():
+            self._halt("kill switch file present")
+            return True
+        if pnl_today <= -abs(self.cfg["max_daily_loss_usdt"]):
+            self._halt(f"daily loss cap hit ({pnl_today:.2f} USDT)")
+            return True
+        self.halted_reason = None
+        return False
 
     def record_fill(self, group: str) -> None:
         self.last_fill[group] = time.time()

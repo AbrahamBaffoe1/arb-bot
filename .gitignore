@@ -4,4 +4,11 @@ __pycache__/
 data/*.db
 data/*.db-*
 data/KILL
+data/*.lock
+data/*.log
+data/*.json
+data/backups/
+data/replay-*/
+data/research/
+deploy/*.plist
 .DS_Store

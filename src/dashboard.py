@@ -23,6 +23,10 @@ def create_app(engine) -> FastAPI:
     async def state():
         return engine.snapshot()
 
+    @app.get('/api/funding')
+    async def funding():
+        return engine.snapshot()['funding']
+
     @app.websocket("/ws")
     async def ws(sock: WebSocket):
         await sock.accept()
@@ -32,7 +36,7 @@ def create_app(engine) -> FastAPI:
                 await asyncio.sleep(1.0)
         except WebSocketDisconnect:
             pass
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            log.exception('Dashboard websocket failed')
 
     return app

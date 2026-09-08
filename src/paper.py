@@ -1,144 +1,166 @@
-"""Paper executor: simulated fills at real book prices with real fees.
-
-Balances are tracked per venue. Cross-venue arbs assume pre-positioned
-inventory on both sides (buy leg consumes USDT on venue A, sell leg
-consumes base on venue B) — exactly like a real arb desk, so inventory
-skew is visible and bounded by risk limits instead of hidden.
-"""
+"""Persistent, cash-constrained simulation. Every balance change is settled atomically."""
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import sqlite3
 import time
 from pathlib import Path
+from .configuration import fingerprint
+from .models import Fill
+from .scanners import buy_quantity, leg
 
-from .models import Fill, Opportunity
-
-log = logging.getLogger("paper")
+log = logging.getLogger('paper')
 
 
 class PaperExecutor:
-    def __init__(self, cfg: dict, db_path: str = "data/trades.db") -> None:
+    def __init__(self, cfg, db_path=None):
         self.cfg = cfg
-        start = cfg["paper"]["starting_balance_usdt"]
-        venues = [v for v, c in cfg["venues"].items() if c.get("enabled")]
-        # balances[venue][asset] -> qty
-        self.balances: dict[str, dict[str, float]] = {v: {"USDT": float(start)} for v in venues}
-        self.fills: list[Fill] = []
+        path = db_path or cfg.get('storage', {}).get('db_path', 'data/engine.db')
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(path)
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('PRAGMA synchronous=FULL')
+        self.db.executescript('''
+            CREATE TABLE IF NOT EXISTS fills(ts REAL, kind TEXT, grp TEXT, detail TEXT, notional REAL, pnl REAL);
+            CREATE TABLE IF NOT EXISTS spreads(ts REAL, grp TEXT, buy_venue TEXT, sell_venue TEXT, gross REAL);
+            CREATE INDEX IF NOT EXISTS idx_spreads_ts ON spreads(ts);
+            CREATE TABLE IF NOT EXISTS paper_state(id INTEGER PRIMARY KEY CHECK(id=1), fingerprint TEXT, body TEXT);
+            CREATE TABLE IF NOT EXISTS expenses(ts REAL, amount REAL, detail TEXT);
+            CREATE TABLE IF NOT EXISTS equity_marks(day INTEGER PRIMARY KEY, initial REAL, equity REAL, ts REAL);
+        ''')
+        self.identity = fingerprint(cfg)
+        state = self.db.execute('SELECT fingerprint,body FROM paper_state WHERE id=1').fetchone()
+        if state and state[0] != self.identity:
+            self.db.close()
+            raise ValueError('Economic configuration changed. Set storage.db_path to a new database to begin a separate evaluation; the old evidence is preserved.')
+        if not state and self.db.execute('SELECT count(*) FROM fills').fetchone()[0]:
+            self.db.close()
+            raise ValueError('Legacy fills lack persistent balances. Use a new storage.db_path.')
+        start = cfg['paper']['starting_balance_usdt']
+        self.balances = {v: {'USDT': float(start)} for v, c in cfg['venues'].items() if c.get('enabled')}
+        self.baseline = {v: {} for v in self.balances}
+        self.seeded = set()
         self.realized_pnl = 0.0
-        self.seeded: set[tuple[str, str]] = set()
-
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(db_path)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute(
-            """CREATE TABLE IF NOT EXISTS fills(
-                 ts REAL, kind TEXT, grp TEXT, detail TEXT,
-                 notional REAL, pnl REAL)"""
-        )
-        self.db.execute(
-            """CREATE TABLE IF NOT EXISTS spreads(
-                 ts REAL, grp TEXT, buy_venue TEXT, sell_venue TEXT,
-                 gross REAL)"""
-        )
-        self.db.execute("CREATE INDEX IF NOT EXISTS idx_spreads_ts ON spreads(ts)")
+        self.last_rejection = None
+        if state:
+            data = json.loads(state[1])
+            self.balances, self.baseline = data['balances'], data['baseline']
+            self.seeded = {tuple(k) for k in data['seeded']}
+            self.realized_pnl = data['realized_pnl']
+        self.fills = [Fill(kind=r[1], group=r[2], detail=r[3], notional=r[4], pnl=r[5], ts=r[0])
+                      for r in self.db.execute('SELECT * FROM fills ORDER BY ts DESC LIMIT 1000').fetchall()[::-1]]
+        self._persist()
         self.db.commit()
 
-    # -- inventory seeding -------------------------------------------------
-    def seed_base(self, venue: str, asset: str, price: float) -> None:
-        """First time we might SELL `asset` on `venue`, park inventory there
-        (bought at current price, so seeding itself creates no fake P&L)."""
-        key = (venue, asset)
-        if key in self.seeded or price <= 0:
-            return
-        notional = self.cfg["risk"]["max_open_skew_usdt"]
-        qty = notional / price
-        self.balances.setdefault(venue, {}).setdefault(asset, 0.0)
-        self.balances[venue][asset] += qty
-        self.balances[venue]["USDT"] = self.balances[venue].get("USDT", 0.0) - notional
-        self.seeded.add(key)
-        log.info("seeded %s %s on %s (%.2f USDT)", f"{qty:.6g}", asset, venue, notional)
+    def _persist(self):
+        body = json.dumps(dict(balances=self.balances, baseline=self.baseline,
+                               seeded=list(self.seeded), realized_pnl=self.realized_pnl))
+        self.db.execute('INSERT OR REPLACE INTO paper_state VALUES (1,?,?)', (self.identity, body))
 
-    # -- execution ---------------------------------------------------------
-    def execute(self, opp: Opportunity) -> Fill | None:
-        if opp.kind == "cross":
-            return self._execute_cross(opp)
-        return self._execute_tri(opp)
+    def seed_inventory(self, store):
+        """Allocate a fixed fraction of starting cash, charging entry fees and depth."""
+        for venue in self.balances:
+            symbols = sorted({m[venue] for m in self.cfg['arb_groups'].values() if venue in m})
+            budget = self.cfg['paper']['starting_balance_usdt'] * self.cfg['paper']['inventory_fraction'] / max(1, len(symbols))
+            for symbol in symbols:
+                base, quote = symbol.split('/')
+                key = (venue, base)
+                if quote != 'USDT' or key in self.seeded or not store.usable(venue, symbol, self.cfg['scanner']['stale_book_ms']):
+                    continue
+                try:
+                    qty = buy_quantity(store, self.cfg, venue, symbol, budget)
+                    item = leg(store, self.cfg, venue, symbol, 'buy', qty)
+                except (ValueError, ArithmeticError):
+                    continue
+                bal = self.balances[venue]
+                if not item or item['cash'] > bal['USDT']:
+                    continue
+                with self.db:
+                    bal['USDT'] -= item['cash']
+                    bal[base] = bal.get(base, 0.0) + qty
+                    self.baseline[venue][base] = bal[base]
+                    self.seeded.add(key)
+                    expense = item['cash'] - item['raw_quote']
+                    self.realized_pnl -= expense
+                    self.db.execute('INSERT INTO expenses VALUES (?,?,?)', (time.time(), expense, f'seed {venue} {base}'))
+                    self._persist()
 
-    def _execute_cross(self, opp: Opportunity) -> Fill | None:
-        buy, sell = opp.legs
-        base = buy["symbol"].split("/")[0]
-        self.seed_base(sell["venue"], base, sell["price"])
-
-        cost = buy["price"] * buy["qty"] * (1 + buy["fee"])
-        proceeds = sell["price"] * sell["qty"] * (1 - sell["fee"])
-
-        bal_a = self.balances[buy["venue"]]
-        bal_b = self.balances[sell["venue"]]
-        if bal_a.get("USDT", 0) < cost or bal_b.get(base, 0) < sell["qty"]:
-            log.warning("skip %s: insufficient paper inventory", opp.group)
+    def project(self, opp):
+        balances = copy.deepcopy(self.balances)
+        for item in opp.legs:
+            bal = balances[item['venue']]
+            base, quote = item['symbol'].split('/')
+            spent, received = (quote, base) if item['side'] == 'buy' else (base, quote)
+            debit, credit = (item['cash'], item['qty']) if item['side'] == 'buy' else (item['qty'], item['cash'])
+            if bal.get(spent, 0) + 1e-10 < debit:
+                return None
+            bal[spent] = max(0, bal.get(spent, 0) - debit)
+            bal[received] = bal.get(received, 0) + credit
+        if balances[opp.sell_venue].get('USDT', 0) < opp.reserve:
             return None
+        balances[opp.sell_venue]['USDT'] -= opp.reserve
+        return balances
 
-        bal_a["USDT"] -= cost
-        bal_a[base] = bal_a.get(base, 0.0) + buy["qty"]
-        bal_b[base] -= sell["qty"]
-        bal_b["USDT"] = bal_b.get("USDT", 0.0) + proceeds
-
-        pnl = proceeds - cost
-        return self._record(opp, pnl)
-
-    def _execute_tri(self, opp: Opportunity) -> Fill | None:
-        venue = opp.buy_venue
-        bal = self.balances[venue]
-        if bal.get("USDT", 0) < opp.notional:
+    def execute(self, opp, prices=None):
+        self.last_rejection = None
+        projected = self.project(opp)
+        if projected is None:
+            self.last_rejection = 'insufficient pre-positioned inventory'
             return None
-        # Triangle math was fully computed (with depth + fees) in the scanner;
-        # settle the loop directly in USDT.
-        bal["USDT"] += opp.net_profit
-        return self._record(opp, opp.net_profit)
-
-    def _record(self, opp: Opportunity, pnl: float) -> Fill:
-        fill = Fill(kind=opp.kind, group=opp.group, detail=opp.detail,
-                    notional=opp.notional, pnl=pnl)
+        if prices is not None and self.inventory_skew_usdt(prices, projected) > self.cfg['risk']['max_open_skew_usdt']:
+            self.last_rejection = 'projected inventory drift exceeds limit'
+            return None
+        before = sum(b.get('USDT', 0) for b in self.balances.values())
+        after = sum(b.get('USDT', 0) for b in projected.values())
+        pnl = after - before
+        if abs(pnl - opp.net_profit) > 1e-6:
+            raise ValueError('Execution cash flows disagree with scanner P&L')
+        fill = Fill(opp.kind, opp.group, opp.detail, opp.notional, pnl)
+        with self.db:
+            self.balances = projected
+            self.realized_pnl += pnl
+            self.db.execute('INSERT INTO fills VALUES (?,?,?,?,?,?)',
+                            (fill.ts, fill.kind, fill.group, fill.detail, fill.notional, fill.pnl))
+            self._persist()
         self.fills.append(fill)
-        self.realized_pnl += pnl
-        self.db.execute("INSERT INTO fills VALUES (?,?,?,?,?,?)",
-                        (fill.ts, fill.kind, fill.group, fill.detail, fill.notional, fill.pnl))
-        self.db.commit()
-        log.info("FILL %s %s pnl=%+.4f USDT", fill.kind, fill.detail, fill.pnl)
+        self.fills = self.fills[-1000:]
+        log.info('PAPER FILL %s pnl=%+.4f USDT', opp.detail, pnl)
         return fill
 
-    # -- spread stats (fuel for report.py fee-scenario analysis) ------------
-    def record_spreads(self, ts: float, rows: list[dict]) -> None:
-        if not rows:
-            return
-        self.db.executemany(
-            "INSERT INTO spreads VALUES (?,?,?,?,?)",
-            [(ts, r["group"], r["buy_venue"], r["sell_venue"], r["gross"]) for r in rows],
-        )
-        self.db.commit()
+    def record_spreads(self, ts, rows):
+        with self.db:
+            self.db.executemany('INSERT INTO spreads VALUES (?,?,?,?,?)',
+                [(ts, r['group'], r['buy_venue'], r['sell_venue'], r['gross']) for r in rows])
 
-    # -- reporting ----------------------------------------------------------
-    def inventory_skew_usdt(self, prices: dict[str, float]) -> float:
-        """Worst per-venue deviation of base holdings from seed level, in USDT."""
-        worst = 0.0
-        for venue, assets in self.balances.items():
-            for asset, qty in assets.items():
-                if asset == "USDT":
-                    continue
-                seeded_notional = self.cfg["risk"]["max_open_skew_usdt"] if (venue, asset) in self.seeded else 0.0
-                px = prices.get(asset, 0.0)
-                drift = abs(qty * px - seeded_notional)
-                worst = max(worst, drift)
-        return worst
+    def inventory_skew_usdt(self, prices, balances=None):
+        return max((sum(abs(qty - self.baseline.get(v, {}).get(a, 0)) * prices.get(a, 0)
+                        for a, qty in assets.items() if a != 'USDT')
+                    for v, assets in (balances or self.balances).items()), default=0)
 
-    def total_equity(self, prices: dict[str, float]) -> float:
-        total = 0.0
-        for assets in self.balances.values():
-            for asset, qty in assets.items():
-                total += qty if asset == "USDT" else qty * prices.get(asset, 0.0)
-        return total
+    def total_equity(self, prices):
+        return sum(qty if a == 'USDT' else qty * prices.get(a, 0)
+                   for assets in self.balances.values() for a, qty in assets.items())
 
-    def pnl_today(self) -> float:
-        midnight = time.time() - (time.time() % 86400)
-        return sum(f.pnl for f in self.fills if f.ts >= midnight)
+    def pnl_today(self):
+        midnight = time.time() // 86400 * 86400
+        pnl = self.db.execute('SELECT coalesce(sum(pnl),0) FROM fills WHERE ts>=?', (midnight,)).fetchone()[0]
+        costs = self.db.execute('SELECT coalesce(sum(amount),0) FROM expenses WHERE ts>=?', (midnight,)).fetchone()[0]
+        return pnl - costs
+
+    def mark_equity(self, prices):
+        now = time.time()
+        day = int(now // 86400)
+        equity = self.total_equity(prices)
+        with self.db:
+            self.db.execute('INSERT INTO equity_marks VALUES(?,?,?,?) ON CONFLICT(day) DO UPDATE SET equity=excluded.equity,ts=excluded.ts',
+                            (day, equity, equity, now))
+        return equity
+
+    def risk_pnl_today(self):
+        mark = self.db.execute('SELECT equity-initial FROM equity_marks WHERE day=?', (int(time.time() // 86400),)).fetchone()
+        return min(self.pnl_today(), mark[0]) if mark else self.pnl_today()
+
+    def close(self):
+        self.db.close()
